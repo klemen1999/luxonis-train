@@ -96,7 +96,7 @@ class LuxonisModel(pl.LightningModule):
         self,
         cfg: Config,
         save_dir: str,
-        input_shape: list[int] | Size,
+        input_shape: dict[str, Size],  # list[int] | Size,
         dataset_metadata: DatasetMetadata | None = None,
         **kwargs,
     ):
@@ -119,7 +119,7 @@ class LuxonisModel(pl.LightningModule):
         self._export: bool = False
 
         self.cfg = cfg
-        self.original_in_shape = Size(input_shape)
+        self.original_in_shape = input_shape  # Size(input_shape)
         self.dataset_metadata = dataset_metadata or DatasetMetadata()
         self.frozen_nodes: list[tuple[nn.Module, int]] = []
         self.graph: dict[str, list[str]] = {}
@@ -154,7 +154,10 @@ class LuxonisModel(pl.LightningModule):
                 frozen_nodes.append((node_name, unfreeze_after))
             nodes[node_name] = (Node, node_cfg.params)
             if not node_cfg.inputs:
-                self.input_shapes[node_name] = [Size(input_shape)]
+                # self.input_shapes[node_name] = [Size(input_shape)]
+                self.input_shapes[node_name] = [
+                    self.original_in_shape[i] for i in node_cfg.loader_inputs
+                ]
             self.graph[node_name] = node_cfg.inputs
 
         self.nodes = self._initiate_nodes(nodes)
@@ -228,16 +231,29 @@ class LuxonisModel(pl.LightningModule):
                 node_input_shapes.append(shape_packet)
                 node_dummy_inputs.append(dummy_output)
 
-                node = Node(
-                    input_shapes=node_input_shapes,
-                    original_in_shape=self.original_in_shape,
-                    dataset_metadata=self.dataset_metadata,
-                    **node_kwargs,
-                )
-                node_outputs = node.run(node_dummy_inputs)
+                # node = Node(
+                #     input_shapes=node_input_shapes,
+                #     original_in_shape=self.original_in_shape,
+                #     dataset_metadata=self.dataset_metadata,
+                #     **node_kwargs,
+                # )
 
-                dummy_outputs[node_name] = node_outputs
-                initiated_nodes[node_name] = node
+                # node_outputs = node.run(node_dummy_inputs)
+
+                # dummy_outputs[node_name] = node_outputs
+                # initiated_nodes[node_name] = node
+
+            node = Node(
+                input_shapes=node_input_shapes,
+                original_in_shape=self.original_in_shape,
+                dataset_metadata=self.dataset_metadata,
+                **node_kwargs,
+            )
+
+            node_outputs = node.run(node_dummy_inputs)
+
+            dummy_outputs[node_name] = node_outputs
+            initiated_nodes[node_name] = node
 
         return nn.ModuleDict(initiated_nodes)
 
@@ -273,8 +289,14 @@ class LuxonisModel(pl.LightningModule):
         @rtype: L{LuxonisOutput}
         @return: Output of the model.
         """
-        input_node_name = list(self.input_shapes.keys())[0]
-        input_dict = {input_node_name: [inputs]}
+        # input_node_name = list(self.input_shapes.keys())[0]
+        # input_dict = {input_node_name: [inputs]}
+
+        input_node_name = list(self.input_shapes.keys())
+        input_dict = {}
+        for node_cfg in self.cfg.model.nodes:
+            if node_cfg.name in input_node_name:
+                input_dict[node_cfg.name] = [inputs[i] for i in node_cfg.loader_inputs]
 
         losses: dict[
             str, dict[str, Tensor | tuple[Tensor, dict[str, Tensor]]]
@@ -285,13 +307,16 @@ class LuxonisModel(pl.LightningModule):
             f"__{node_name}_input__": {"features": input_tensors}
             for node_name, input_tensors in input_dict.items()
         }
+
         for node_name, node, input_names, unprocessed in traverse_graph(
             self.graph, cast(dict[str, BaseNode], self.nodes)
         ):
             # Special input for the first node. Will be changed when
             # multiple inputs will be supported in `luxonis-ml.data`.
+            is_input_node = False
             if not input_names:
                 input_names = [f"__{node_name}_input__"]
+                is_input_node = True
 
             node_inputs = [computed[pred] for pred in input_names]
             outputs = node.run(node_inputs)
@@ -324,6 +349,9 @@ class LuxonisModel(pl.LightningModule):
 
             for computed_name in list(computed.keys()):
                 if computed_name in self.outputs:
+                    continue
+                elif is_input_node and computed_name not in input_names:
+                    # In case we have multiple inputs but current node only consumed one of them
                     continue
                 for node_name in unprocessed:
                     if computed_name in self.graph[node_name]:
@@ -663,6 +691,7 @@ class LuxonisModel(pl.LightningModule):
         optim_params = cfg_optimizer.params | {
             "params": filter(lambda p: p.requires_grad, self.parameters()),
         }
+
         optimizer = OPTIMIZERS.get(cfg_optimizer.name)(**optim_params)
 
         scheduler_params = cfg_scheduler.params | {"optimizer": optimizer}
