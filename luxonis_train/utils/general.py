@@ -46,8 +46,8 @@ class DatasetMetadata:
         """
         if classes is None and n_classes is not None:
             classes = {
-                LabelType(lbl): [str(i) for i in range(n_classes)]
-                for lbl in LabelType.__members__
+                LabelType(lbl.value): [str(i) for i in range(n_classes)]
+                for lbl in LabelType
             }
         self._classes = classes
         self._keypoint_names = keypoint_names
