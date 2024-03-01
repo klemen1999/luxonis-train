@@ -413,18 +413,14 @@ class LuxonisModel(pl.LightningModule):
         """
 
         inputs = {
-            name: [torch.zeros(shape).to(self.device) for shape in shapes]
-            for name, shapes in self.input_shapes.items()
+            k: torch.zeros(shape).to(self.device) for k, shape in self.original_in_shape.items()
         }
-
-        # TODO: multiple inputs
-        inp = list(inputs.values())[0][0]
 
         for module in self.modules():
             if isinstance(module, BaseNode):
                 module.set_export_mode()
 
-        outputs = self.forward(inp.clone()).outputs
+        outputs = self.forward(inputs).outputs
         output_order = sorted(
             [
                 (node_name, output_name, i)
@@ -467,7 +463,7 @@ class LuxonisModel(pl.LightningModule):
         if "output_names" not in kwargs:
             kwargs["output_names"] = output_names
 
-        self.to_onnx(save_path, inp, **kwargs)
+        self.to_onnx(save_path, {'inputs': inputs}, **kwargs)
 
         self.forward = old_forward  # type: ignore
 
@@ -578,7 +574,14 @@ class LuxonisModel(pl.LightningModule):
         inputs, labels = batch
         images = None
         if self._logged_images < self.cfg.trainer.num_log_images:
-            images = get_unnormalized_images(self.cfg, inputs)
+            input_images = inputs
+            # Ugly hack, but it works for now
+            if isinstance(inputs, dict):
+                for k, v in inputs.items():
+                    if 'img' in k:
+                        input_images = v
+                        break
+            images = get_unnormalized_images(self.cfg, input_images)
         outputs = self.forward(
             inputs,
             labels,
