@@ -132,6 +132,7 @@ class LuxonisModel(pl.LightningModule):
         self.validation_step_outputs: list[Mapping[str, Tensor | float | int]] = []
         self.losses: dict[str, dict[str, BaseLoss]] = defaultdict(dict)
         self.metrics: dict[str, dict[str, BaseMetric]] = defaultdict(dict)
+        self.train_metrics: dict[str, dict[str, BaseMetric]] = defaultdict(dict)
         self.visualizers: dict[str, dict[str, BaseVisualizer]] = defaultdict(dict)
 
         self._logged_images = 0
@@ -179,6 +180,11 @@ class LuxonisModel(pl.LightningModule):
                     )
                 self.main_metric = f"{node_name}/{metric_name}"
 
+        for metric_cfg in self.cfg.model.metrics:
+            self._init_attached_module(
+                metric_cfg, BaseMetric.REGISTRY, self.train_metrics
+            )
+
         for visualizer_cfg in self.cfg.model.visualizers:
             self._init_attached_module(
                 visualizer_cfg, BaseVisualizer.REGISTRY, self.visualizers
@@ -188,6 +194,7 @@ class LuxonisModel(pl.LightningModule):
         self.frozen_nodes = [(self.nodes[name], e) for name, e in frozen_nodes]
         self.losses = self._to_module_dict(self.losses)  # type: ignore
         self.metrics = self._to_module_dict(self.metrics)  # type: ignore
+        self.train_metrics = self._to_module_dict(self.train_metrics)  # type: ignore
         self.visualizers = self._to_module_dict(self.visualizers)  # type: ignore
 
         self.load_checkpoint(self.cfg.model.weights)
@@ -266,6 +273,7 @@ class LuxonisModel(pl.LightningModule):
         compute_loss: bool = True,
         compute_metrics: bool = False,
         compute_visualizations: bool = False,
+        use_train_metrics: bool = False,
     ) -> LuxonisOutput:
         """Forward pass of the model.
 
@@ -308,6 +316,8 @@ class LuxonisModel(pl.LightningModule):
             for node_name, input_tensors in input_dict.items()
         }
 
+        METRICS = self.train_metrics if use_train_metrics else self.metrics
+
         for node_name, node, input_names, unprocessed in traverse_graph(
             self.graph, cast(dict[str, BaseNode], self.nodes)
         ):
@@ -326,8 +336,8 @@ class LuxonisModel(pl.LightningModule):
                 for loss_name, loss in self.losses[node_name].items():
                     losses[node_name][loss_name] = loss.run(outputs, labels)
 
-            if compute_metrics and node_name in self.metrics and labels is not None:
-                for metric in self.metrics[node_name].values():
+            if compute_metrics and node_name in METRICS and labels is not None:
+                for metric in METRICS[node_name].values():
                     metric.run_update(outputs, labels)
 
             if (
@@ -369,7 +379,7 @@ class LuxonisModel(pl.LightningModule):
             outputs=outputs_dict, losses=losses, visualizations=visualizations
         )
 
-    def compute_metrics(self) -> dict[str, dict[str, Tensor]]:
+    def compute_metrics(self, use_train_metrics=False) -> dict[str, dict[str, Tensor]]:
         """Computes metrics and returns their values.
 
         Goes through all metrics in the `metrics` attribute and computes their values.
@@ -380,8 +390,10 @@ class LuxonisModel(pl.LightningModule):
             attached. The first key identifies the node, the second key identifies
             the specific metric.
         """
+        METRICS = self.train_metrics if use_train_metrics else self.metrics
+        
         metric_results: dict[str, dict[str, Tensor]] = defaultdict(dict)
-        for node_name, metrics in self.metrics.items():
+        for node_name, metrics in METRICS.items():
             for metric_name, metric in metrics.items():
                 match metric.compute():
                     case (Tensor(data=metric_value), dict(submetrics)):
@@ -518,7 +530,8 @@ class LuxonisModel(pl.LightningModule):
 
     def training_step(self, train_batch: tuple[Tensor, Labels]) -> Tensor:
         """Performs one step of training with provided batch."""
-        outputs = self.forward(*train_batch)
+        should_compute_metrics = self._is_train_eval_epoch()
+        outputs = self.forward(*train_batch, compute_metrics=should_compute_metrics, use_train_metrics=True)
         assert outputs.losses, "Losses are empty, check if you have defined any loss"
 
         loss, training_step_output = self.process_losses(outputs.losses)
@@ -542,6 +555,20 @@ class LuxonisModel(pl.LightningModule):
 
         for key, value in epoch_train_losses.items():
             self.log(f"train/{key}", value, sync_dist=True)
+
+        if self._is_train_eval_epoch():
+            metric_results: dict[str, dict[str, float]] = defaultdict(dict)
+            logger.info(f"Computing metrics on 'train' subset ...")
+            computed_metrics = self.compute_metrics(use_train_metrics=True)
+            logger.info("Metrics computed.")
+            for node_name, metrics in computed_metrics.items():
+                for metric_name, metric_value in metrics.items():
+                    metric_results[node_name][metric_name] = metric_value.cpu().item()
+                    self.log(
+                        f"train/metric/{node_name}/{metric_name}",
+                        metric_value,
+                        sync_dist=True,
+                    )
 
         self.training_step_outputs.clear()
 
